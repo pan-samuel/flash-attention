@@ -5,7 +5,7 @@ import time
 import torch.utils.cpp_extension
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from triton_flashattention import triton_attention
+from fused_attention import triton_attention
 
 
 device = "0"  # Assuming single GPU
@@ -14,7 +14,7 @@ device = "0"  # Assuming single GPU
 module = torch.utils.cpp_extension.load(
     "module",
     sources=["flashattention_v1.cu", "flashattention_v2.cu", "flashattention_v3.cu", 
-             "flashattention_v4.cu", "flashattention_v5.cu", "flashattention_v6.cu", 
+             "flashattention_v4.cu", "flashattention_v5.cu", "flashattention_v6.cu", "flashattention_v7.cu", 
              "flash_attention.cpp"],
     extra_cuda_cflags=["-O3", "--use_fast_math", "--ptxas-options=-v", "-allow-unsupported-compiler"],
     verbose=False,
@@ -85,20 +85,24 @@ def benchmark(func, *args, warmup_steps=10, timing_steps=10, **kwargs):
     # Return median time
     return sorted(times)[len(times) // 2]
 
-def calculate_flops(B, n_heads, T, head_dim, time_ms):
+def calculate_flops(B, n_heads, T, head_dim, time_ms, is_causal=True):
     """Calculate FLOPS for attention computation"""
     # Attention FLOPS: 4 * B * n_heads * T^2 * head_dim for QK^T + softmax + weighted sum
-    flops = 4 * B * n_heads * T * T * head_dim
-    flops_per_second = flops / (time_ms / 1000)  # Convert ms to seconds
-    return flops_per_second / 1e12  # Convert to TFLOPS
-
+    flops = 4 * T * T * head_dim * n_heads * B
+    
+    # With causal mask, only ~half the computation is done
+    if is_causal:
+        flops = flops // 2
+    
+    flops_per_second = flops / (time_ms / 1000) 
+    return flops_per_second / 1e12
 
 def main():
 
     set_fixed_clocks()
 
     B, n_heads = 8, 12
-    T, head_dim = 1024, 64
+    T, head_dim = 4096, 64
     sm_scale = 1.0 / math.sqrt(head_dim)
     torch.manual_seed(0)
     dtype = torch.float32
@@ -106,9 +110,9 @@ def main():
     
     
     # Generate input tensors
-    q = torch.randn(B, n_heads, T, head_dim, dtype=dtype, device=device, requires_grad=False)
-    k = torch.randn(B, n_heads, T, head_dim, dtype=dtype, device=device, requires_grad=False)
-    v = torch.randn(B, n_heads, T, head_dim, dtype=dtype, device=device, requires_grad=False)
+    q = torch.randn(B, n_heads, T, head_dim, dtype=dtype, device=device, requires_grad=False).cuda()
+    k = torch.randn(B, n_heads, T, head_dim, dtype=dtype, device=device, requires_grad=False).cuda()
+    v = torch.randn(B, n_heads, T, head_dim, dtype=dtype, device=device, requires_grad=False).cuda()
         
     # Get reference output using default SDPA (will use the best available kernel)
     output_ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -120,6 +124,7 @@ def main():
     output_v4 = module.flashattn_v4(q, k, v)
     output_v5 = module.flashattn_v5(q, k, v)
     output_v6 = module.flashattn_v6(q, k, v)
+    output_v7 = module.flashattn_v7(q, k, v)
 
     # Verify correctness
     print("Verifying correctness...")
@@ -129,6 +134,7 @@ def main():
     torch.testing.assert_close(output_v4, output_ref, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(output_v5, output_ref, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(output_v6, output_ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(output_v7, output_ref, rtol=1e-4, atol=1e-4)
     print("All kernels passed correctness test!")
     print()
 
@@ -139,61 +145,51 @@ def main():
     
     # Build list of kernels to test based on availability
     kernels_to_test = [
-        ("Manual Attention", lambda: manual_attention_masking(q, k, v)),
-        ("PyTorch SDPA (Default)", lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True)),
-        ("PyTorch SDPA (Math)", "math"),
-        ("PyTorch SDPA (Efficient)", "efficient"),
-        ("Triton Flash Attention", lambda: triton_attention(q, k, v, sm_scale)),
+        ("Manual Attention", lambda: manual_attention_masking(q, k, v), False),
+        ("PyTorch SDPA (Default)", lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True), True),
+        ("PyTorch SDPA (Math)", "math", True),
+        ("PyTorch SDPA (Efficient)", "efficient", True),
+        ("Triton Flash Attention", lambda: triton_attention(q, k, v, sm_scale), True),
+        ("Custom v2", lambda: module.flashattn_v2(q, k, v), False),
+        ("Custom v3", lambda: module.flashattn_v3(q, k, v), False),
+        ("Custom v4", lambda: module.flashattn_v4(q, k, v), False),
+        ("Custom v5", lambda: module.flashattn_v5(q, k, v), False),
+        ("Custom v6", lambda: module.flashattn_v6(q, k, v), False),
+        ("Custom v7", lambda: module.flashattn_v7(q, k, v), False),
     ]
-    
-    # Add custom kernels
-    kernels_to_test.extend([
-        # ("Custom v1", lambda: module.flashattn_v1(q, k, v)),
-        ("Custom v2", lambda: module.flashattn_v2(q, k, v)),
-        ("Custom v3", lambda: module.flashattn_v3(q, k, v)),
-        ("Custom v4", lambda: module.flashattn_v4(q, k, v)),
-        ("Custom v5", lambda: module.flashattn_v5(q, k, v)),
-        ("Custom v6", lambda: module.flashattn_v6(q, k, v)),
-    ])
+
     
     results = []
     
     for kernel_info in kernels_to_test:
-        if len(kernel_info) == 2:
+        if len(kernel_info) == 3:
+            name, func_or_backend, is_causal = kernel_info
+        else:
             name, func_or_backend = kernel_info
+            is_causal = True
             
-            if isinstance(func_or_backend, str):
-                backend_map = {
-                    "math": SDPBackend.MATH,
-                    "efficient": SDPBackend.EFFICIENT_ATTENTION,
-                }
-                backend = backend_map[func_or_backend]
-                func = lambda: None  
-            else:
-                func = func_or_backend
-                backend = None
-        
-        
-        if backend is not None:
-            # Use specific PyTorch backend
+        if isinstance(func_or_backend, str):
+            backend_map = {
+                "math": SDPBackend.MATH,
+                "efficient": SDPBackend.EFFICIENT_ATTENTION,
+            }
+            backend = backend_map[func_or_backend]
             def sdpa_func():
                 with sdpa_kernel([backend]):
                     return F.scaled_dot_product_attention(q, k, v, is_causal=True)
             median_time = benchmark(sdpa_func)
         else:
+            func = func_or_backend
             median_time = benchmark(func)
         
-        tflops = calculate_flops(B, n_heads, T, head_dim, median_time)
+        tflops = calculate_flops(B, n_heads, T, head_dim, median_time, is_causal)
         results.append((name, median_time, tflops))
         print(f"{name:<30} {median_time:<12.4f} {tflops:<10.2f}")
-        
-        # Small sleep between benchmarks for thermal stability
         time.sleep(0.5)
             
-    
     print("\nBenchmark Results Summary:")
     print("-" * 85)
-    sorted_results = sorted(results, key=lambda x: x[1])  # Sort by time (ascending)
+    sorted_results = sorted(results, key=lambda x: x[1])
     for i, (name, time_ms, tflops) in enumerate(sorted_results):
         speedup = sorted_results[0][1] / time_ms if i > 0 else 1.0
         print(f"{i+1:2d}. {name:<28} {time_ms:8.4f}ms  {tflops:6.2f} TFLOPS  {speedup:5.2f}x")
