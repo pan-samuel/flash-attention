@@ -15,6 +15,7 @@ FlashAttentionFn flashattn_v3;
 FlashAttentionFn flashattn_v4;
 FlashAttentionFn flashattn_v5;
 FlashAttentionFn flashattn_v6;
+FlashAttentionFn flashattn_v7;
 
 
 
@@ -48,4 +49,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("flashattn_v4", &flashattn_pt<flashattn_v4>, "Flash Attention v4");
     m.def("flashattn_v6", &flashattn_pt<flashattn_v6>, "Flash Attention v6");
     m.def("flashattn_v5", &flashattn_pt<flashattn_v5>, "Flash Attention v5");
+    m.def("flashattn_v7", &flashattn_pt<flashattn_v7>, "Flash Attention v7");
 }
